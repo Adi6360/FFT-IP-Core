@@ -11,7 +11,7 @@ Top_fft.v
 module Top_fft #(
     parameter DATAWIDTH     = 16,
     parameter ADDRESSWIDTH  = 16,
-    parameter CONFIGWIDTH   = 48,
+    parameter CONFIGWIDTH   = 16,
     parameter FFT_LEN       = 64
 )(
     input  wire aclk,
@@ -169,7 +169,7 @@ tb_Top_fft.v
 module coe_waveforms #(
     parameter DATAWIDTH    = 16,
     parameter ADDRESSWIDTH = 16,
-    parameter CONFIGWIDTH  = 48
+    parameter CONFIGWIDTH  = 16
 )();
 
     /* ================= CLOCK & RESET ================= */
@@ -248,88 +248,241 @@ endmodule
 
 FINAL MATLAB COE + GOLDEN INPUT GENERATION (MATCHES RTL)
 
-% ============================================================
-% PARAMETERS (MATCH RTL + FFT IP)
-% ============================================================
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+module Top_fft #(
+    parameter DATAWIDTH    = 16,
+    parameter ADDRESSWIDTH = 6,    // 64 deep BRAM
+    parameter CONFIGWIDTH  = 16,
+    parameter FFT_LEN      = 64
+)(
+    input  wire aclk,
+    input  wire aresetn,
 
-N    = 64;     % FFT length (64-point FFT)
-GRID = 64;     % Number of FFT frames (OTFS grid size)
-IN_BW  = 16;   % Input bit-width (signed, BRAM format)
-OUT_BW = 24;   % FFT IP output bit-width (per real/imag)
+    /* ================= FFT CONFIG ================= */
+    output wire [CONFIGWIDTH-1:0] s_axis_config_tdata,
+    output wire                   s_axis_config_tvalid,
+    input  wire                   s_axis_config_tready,
 
+    /* ================= FFT INPUT ================= */
+    output reg  [31:0] s_axis_data_tdata,
+    output reg         s_axis_data_tvalid,
+    input  wire        s_axis_data_tready,
+    output reg         s_axis_data_tlast,
 
-% ============================================================
-% GENERATE 64x64 OTFS INPUT GRID (COMPLEX)
-% Each column = one FFT frame
-% ============================================================
+    /* ================= FFT OUTPUT ================= */
+    output wire [47:0] m_axis_data_tdata,
+    output wire        m_axis_data_tvalid,
+    input  wire        m_axis_data_tready,
+    output wire        m_axis_data_tlast,
 
-otfs_grid = zeros(N, GRID);   % 64 rows × 64 columns
+    /* ================= OUTPUT SPLIT ================= */
+    output wire signed [22:0] out_real_sine,
+    output wire signed [22:0] out_imag_sine,
 
-for c = 1:GRID
-    for r = 1:N
-        % Deterministic complex exponential
-        % Ideal for FFT verification and OTFS testing
-        otfs_grid(r,c) = exp(1j * 2*pi * (r-1) * (c-1) / N);
+    /* ================= EVENTS ================= */
+    output wire event_frame_started,
+    output wire event_tlast_unexpected,
+    output wire event_tlast_missing,
+    output wire event_status_channel_halt,
+    output wire event_data_in_channel_halt,
+    output wire event_data_out_channel_halt
+);
+
+    /* ================= FSM ================= */
+    localparam IDLE        = 3'd0;
+    localparam SEND_CFG    = 3'd1;
+    localparam CFG_WAIT    = 3'd2;
+    localparam SEND_DATA   = 3'd3;
+    localparam WAIT_OUTPUT = 3'd4;
+
+    reg [2:0] state;
+
+    /* ================= CONFIG ================= */
+    reg config_valid;
+    assign s_axis_config_tdata  = 16'h0106;   // FFT, NFFT=6 (64)
+    assign s_axis_config_tvalid = config_valid;
+
+    /* ================= BRAM ================= */
+    reg  [ADDRESSWIDTH-1:0] bram_addr;
+    wire [31:0] bram_dout;
+    reg  [31:0] bram_dout_r;   // pipeline register
+
+    blk_mem_gen_0 u_bram (
+        .clka  (aclk),
+        .addra (bram_addr),
+        .douta (bram_dout)
+    );
+
+    always @(posedge aclk)
+        bram_dout_r <= bram_dout;
+
+    /* ================= COUNTER ================= */
+    reg [6:0] sample_cnt;
+
+    /* ================= FSM ================= */
+    always @(posedge aclk) begin
+        if (!aresetn) begin
+            state              <= IDLE;
+            config_valid       <= 1'b0;
+            s_axis_data_tvalid <= 1'b0;
+            s_axis_data_tlast  <= 1'b0;
+            bram_addr          <= 0;
+            sample_cnt         <= 0;
+        end else begin
+            case (state)
+
+                IDLE: begin
+                    config_valid <= 1'b1;
+                    state        <= SEND_CFG;
+                end
+
+                SEND_CFG: begin
+                    if (s_axis_config_tready) begin
+                        config_valid <= 1'b0;
+                        state <= CFG_WAIT;
+                    end
+                end
+
+                CFG_WAIT: begin
+                    bram_addr  <= 0;
+                    sample_cnt <= 0;
+                    state <= SEND_DATA;
+                end
+
+                SEND_DATA: begin
+                    if (s_axis_data_tready) begin
+                        s_axis_data_tvalid <= 1'b1;
+                        s_axis_data_tdata  <= bram_dout_r;
+                        s_axis_data_tlast  <= (sample_cnt == FFT_LEN-1);
+
+                        bram_addr  <= bram_addr + 1;
+                        sample_cnt <= sample_cnt + 1;
+
+                        if (sample_cnt == FFT_LEN-1) begin
+                            s_axis_data_tvalid <= 1'b0;
+                            s_axis_data_tlast  <= 1'b0;
+                            state <= WAIT_OUTPUT;
+                        end
+                    end
+                end
+
+                WAIT_OUTPUT: begin
+                    if (m_axis_data_tvalid && m_axis_data_tlast)
+                        state <= IDLE;
+                end
+
+                default: state <= IDLE;
+            endcase
+        end
     end
+
+    /* ================= FFT IP ================= */
+    xfft_0 fft_i (
+        .aclk(aclk),
+        .aresetn(aresetn),
+
+        .s_axis_config_tdata (s_axis_config_tdata),
+        .s_axis_config_tvalid(s_axis_config_tvalid),
+        .s_axis_config_tready(s_axis_config_tready),
+
+        .s_axis_data_tdata   (s_axis_data_tdata),
+        .s_axis_data_tvalid  (s_axis_data_tvalid),
+        .s_axis_data_tready  (s_axis_data_tready),
+        .s_axis_data_tlast   (s_axis_data_tlast),
+
+        .m_axis_data_tdata   (m_axis_data_tdata),
+        .m_axis_data_tvalid  (m_axis_data_tvalid),
+        .m_axis_data_tready  (m_axis_data_tready),
+        .m_axis_data_tlast   (m_axis_data_tlast),
+
+        .event_frame_started         (event_frame_started),
+        .event_tlast_unexpected      (event_tlast_unexpected),
+        .event_tlast_missing         (event_tlast_missing),
+        .event_status_channel_halt   (event_status_channel_halt),
+        .event_data_in_channel_halt  (event_data_in_channel_halt),
+        .event_data_out_channel_halt (event_data_out_channel_halt)
+    );
+
+    /* ================= OUTPUT SPLIT ================= */
+    assign out_real_sine = m_axis_data_tdata[22:0];
+    assign out_imag_sine = m_axis_data_tdata[46:24];
+
+endmodule
+
+
+fft_output_data
+
+% ============================================================
+% FFT OUTPUT COE GENERATION (64-point, 48-bit)
+% ============================================================
+
+N = 64;
+
+IN_BW  = 16;   % input width
+OUT_BW = 23;   % FFT IP output width per real/imag
+
+% ------------------------------------------------------------
+% Load input used for RTL (same as input COE)
+% ------------------------------------------------------------
+load('fft_input.mat');   % fft_in_serial (complex, length 64)
+
+% Undo input scaling
+in_scale = 2^(IN_BW-2);
+x = fft_in_serial / in_scale;
+
+% ------------------------------------------------------------
+% MATLAB FFT (golden reference)
+% ------------------------------------------------------------
+y = fft(x, N);
+
+% ------------------------------------------------------------
+% FFT IP GROWTH (UNSCALED MODE)
+% Vivado FFT grows by log2(N) bits
+% ------------------------------------------------------------
+growth = log2(N);        % = 6 for N=64
+y = y * (2^growth);
+
+% ------------------------------------------------------------
+% FIXED-POINT CONVERSION (TRUNCATION)
+% ------------------------------------------------------------
+y_re = floor(real(y));
+y_im = floor(imag(y));
+
+% Saturate to signed 23-bit
+MAX =  2^(OUT_BW-1)-1;
+MIN = -2^(OUT_BW-1);
+
+y_re = max(min(y_re, MAX), MIN);
+y_im = max(min(y_im, MAX), MIN);
+
+% ------------------------------------------------------------
+% PACK INTO 48-BIT WORD
+% [46:24] = IMAG, [22:0] = REAL
+% ------------------------------------------------------------
+fft_out_words = zeros(N,1,'uint64');
+
+for k = 1:N
+    fft_out_words(k) = ...
+        bitshift(uint64(typecast(int32(y_im(k)), 'uint32')), 24) + ...
+        uint64(typecast(int32(y_re(k)), 'uint32'));
 end
 
+% ------------------------------------------------------------
+% WRITE COE FILE
+% ------------------------------------------------------------
+fid = fopen('fft_output_64.coe','w');
+fprintf(fid,'memory_initialization_radix=16;\n');
+fprintf(fid,'memory_initialization_vector=\n');
 
-% ============================================================
-% COLUMN-WISE SERIALIZATION (OTFS CORRECT ORDER)
-% 0–63, 64–127, ..., 4032–4095
-% ============================================================
-
-fft_in_serial = reshape(otfs_grid, [], 1);   % 4096×1 complex vector
-
-
-% ============================================================
-% FIXED-POINT SCALING (INPUT SIDE)
-% Matches BRAM → FFT IP input
-% ============================================================
-
-in_scale = 2^(IN_BW-2);    % Leave 2 bits of headroom
-
-re_in = round(real(fft_in_serial) * in_scale);
-im_in = round(imag(fft_in_serial) * in_scale);
-
-% Saturate to signed 16-bit
-re_in = max(min(re_in,  2^(IN_BW-1)-1), -2^(IN_BW-1));
-im_in = max(min(im_in,  2^(IN_BW-1)-1), -2^(IN_BW-1));
-
-
-% ============================================================
-% PACK REAL & IMAG INTO 32-BIT WORD (BRAM FORMAT)
-% [31:16] → Real, [15:0] → Imag
-% ============================================================
-
-bram_words = zeros(length(re_in), 1, 'uint32');
-
-for k = 1:length(re_in)
-    bram_words(k) = bitshift(uint32(typecast(int16(re_in(k)), 'uint16')), 16) ...
-                  + uint32(typecast(int16(im_in(k)), 'uint16'));
+for k = 1:N-1
+    fprintf(fid,'%012X,\n', fft_out_words(k));
 end
-
-
-% ============================================================
-% WRITE COE FILE (FOR blk_mem_gen_0)
-% ============================================================
-
-fid = fopen('fft_input.coe', 'w');
-
-fprintf(fid, 'memory_initialization_radix=16;\n');
-fprintf(fid, 'memory_initialization_vector=\n');
-
-fprintf(fid, '%08X,\n', bram_words(1:end-1));
-fprintf(fid, '%08X;\n',  bram_words(end));
-
+fprintf(fid,'%012X;\n', fft_out_words(N));
 fclose(fid);
 
+disp('✅ fft_output_64.coe generated successfully');
 
-% ============================================================
-% SAVE INPUT DATA FOR MATLAB ↔ RTL GOLDEN COMPARISON
-% ============================================================
-
-save('fft_input.mat', 'fft_in_serial');
 
 Assumptions (must match your FFT IP)
 Setting
