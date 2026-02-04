@@ -331,6 +331,149 @@ fclose(fid);
 
 save('fft_input.mat', 'fft_in_serial');
 
+Assumptions (must match your FFT IP)
+Setting
+Value
+FFT Length
+64
+Direction
+Forward FFT
+Scaling
+Unscaled
+Input width
+16-bit
+Output width
+24-bit
+Output format
+Fixed-point
+(This matches what you’ve been using so far.)
+✅ MATLAB FFT OUTPUT COE GENERATOR (FINAL)
+🔹 fft_output_golden.m
+
+% ============================================================
+% PARAMETERS (MATCH FFT IP + RTL)
+% ============================================================
+
+N       = 64;      % FFT length
+GRID    = 64;      % Number of FFT frames
+IN_BW   = 16;      % Input bit-width
+OUT_BW  = 24;      % FFT output bit-width (per real/imag)
 
 
+% ============================================================
+% LOAD INPUT USED FOR RTL (SAME AS BRAM CONTENT)
+% ============================================================
 
+load('fft_input.mat');    % loads: fft_in_serial (4096x1 complex)
+
+
+% ============================================================
+% RESHAPE INTO FRAMES (COLUMN-WISE)
+% ============================================================
+
+fft_in = reshape(fft_in_serial, N, GRID);
+
+
+% ============================================================
+% PERFORM FFT (MATCH XILINX FFT IP)
+% - Column-wise FFT
+% - No normalization
+% ============================================================
+
+fft_out = zeros(N, GRID);
+
+for c = 1:GRID
+    fft_out(:,c) = fft(fft_in(:,c));
+end
+
+
+% ============================================================
+% SERIALIZE OUTPUT (FRAME ORDER)
+% ============================================================
+
+fft_out_serial = reshape(fft_out, [], 1);   % 4096x1 complex
+
+
+% ============================================================
+% FIXED-POINT SCALING (FFT OUTPUT)
+% ------------------------------------------------------------
+% Xilinx FFT IP:
+% Unscaled → grows by log2(N) = 6 bits
+% Input scale = 2^(IN_BW-2)
+% ============================================================
+
+growth_bits = log2(N);     % = 6
+out_scale = 2^(IN_BW-2) * 2^growth_bits;
+
+re_out = round(real(fft_out_serial) * out_scale);
+im_out = round(imag(fft_out_serial) * out_scale);
+
+
+% ============================================================
+% SATURATION TO 24-BIT SIGNED
+% ============================================================
+
+MAX_VAL =  2^(OUT_BW-1)-1;
+MIN_VAL = -2^(OUT_BW-1);
+
+re_out = max(min(re_out, MAX_VAL), MIN_VAL);
+im_out = max(min(im_out, MAX_VAL), MIN_VAL);
+
+
+% ============================================================
+% PACK INTO 48-BIT WORD
+% [47:24] → REAL
+% [23:0]  → IMAG
+% ============================================================
+
+fft_out_words = zeros(length(re_out), 1, 'uint64');
+
+for k = 1:length(re_out)
+    real_u = uint32(typecast(int32(re_out(k)), 'uint32'));
+    imag_u = uint32(typecast(int32(im_out(k)), 'uint32'));
+
+    fft_out_words(k) = bitshift(uint64(real_u), 24) ...
+                     + uint64(bitand(imag_u, hex2dec('FFFFFF')));
+end
+
+
+% ============================================================
+% WRITE GOLDEN FFT OUTPUT COE
+% ============================================================
+
+fid = fopen('fft_output_golden.coe', 'w');
+
+fprintf(fid, 'memory_initialization_radix=16;\n');
+fprintf(fid, 'memory_initialization_vector=\n');
+
+fprintf(fid, '%012X,\n', fft_out_words(1:end-1));
+fprintf(fid, '%012X;\n',  fft_out_words(end));
+
+fclose(fid);
+
+disp('✔ fft_output_golden.coe generated successfully');
+
+
+% ============================================================
+% SAVE FOR MATLAB ↔ RTL NUMERICAL COMPARISON
+% ============================================================
+
+save('fft_output_golden.mat', 're_out', 'im_out');
+
+How to use this in practice
+🔹 RTL side
+Capture FFT output (m_axis_data_tdata)
+Store or dump it to a text/COE file
+🔹 MATLAB side
+Load fft_output_golden.mat
+Compare:
+error_real = rtl_real - re_out;
+error_imag = rtl_imag - im_out;
+max(abs(error_real))
+max(abs(error_imag))
+Expected result:
+Error ≤ ±1 LSB
+Pro tip (very important)
+If you later enable scaling schedule in FFT IP:
+out_scale must change
+Otherwise MATLAB and RTL will not match
