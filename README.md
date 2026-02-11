@@ -225,3 +225,276 @@ data_tvalid_reg → 2 cycles
 tlast condition → same 2 cycles
 
 
+
+
+% ============================================================
+% PARAMETERS — MATCH VIVADO FFT IP
+% ============================================================
+N = 64;
+
+IN_W  = 16;   % input real/imag width
+OUT_W = 24;   % FFT IP output real/imag width
+
+% ============================================================
+% GENERATE TEST COMPLEX INPUT (I + jQ)
+% ============================================================
+n = 0:N-1;
+
+% single-tone complex exponential (clean FFT peak)
+x = exp(1j*2*pi*5*n/N);
+
+% ============================================================
+% FIXED POINT INPUT QUANTIZATION (SIGNED 16 BIT)
+% truncation mode
+% ============================================================
+scale_in = 2^(IN_W-1);
+
+re_in = fix(real(x) * scale_in);
+im_in = fix(imag(x) * scale_in);
+
+re_in = max(min(re_in,  2^(IN_W-1)-1), -2^(IN_W-1));
+im_in = max(min(im_in,  2^(IN_W-1)-1), -2^(IN_W-1));
+
+x_fixed = re_in + 1j*im_in;
+
+% ============================================================
+% FFT — UN SCALED (matches IP setting)
+% ============================================================
+X = fft(x_fixed);   % no /N scaling
+
+% ============================================================
+% OUTPUT TRUNCATION TO 24 BIT (NOT ROUND)
+% ============================================================
+scale_out = 1;   % already integer domain
+
+re_out = fix(real(X) * scale_out);
+im_out = fix(imag(X) * scale_out);
+
+re_out = max(min(re_out,  2^(OUT_W-1)-1), -2^(OUT_W-1));
+im_out = max(min(im_out,  2^(OUT_W-1)-1), -2^(OUT_W-1));
+
+% ============================================================
+% PACK INPUT → 32 BIT WORD (BRAM FORMAT)
+% [31:16] I , [15:0] Q
+% ============================================================
+in_word = zeros(N,1,'uint32');
+
+for k=1:N
+    in_word(k) = bitshift(uint32(typecast(int16(re_in(k)),'uint16')),16) + ...
+                          uint32(typecast(int16(im_in(k)),'uint16'));
+end
+
+% ============================================================
+% PACK OUTPUT → 48 BIT WORD (FFT AXIS FORMAT)
+% [47:24] REAL , [23:0] IMAG
+% ============================================================
+out_word = zeros(N,1,'uint64');
+
+for k=1:N
+    r = uint64(typecast(int32(re_out(k)),'uint32'));
+    i = uint64(typecast(int32(im_out(k)),'uint32'));
+    out_word(k) = bitshift(r,24) + bitand(i, hex2dec('FFFFFF'));
+end
+
+% ============================================================
+% -------- COE WRITER FUNCTION --------
+% ============================================================
+write_coe = @(fname, data, width_hex) ...
+    write_coe_file(fname, data, width_hex);
+
+% ============================================================
+% WRITE COE FILES — INPUT
+% ============================================================
+write_coe('fft_in_real.coe', re_in, 4);
+write_coe('fft_in_imag.coe', im_in, 4);
+write_coe('fft_in_packed32.coe', in_word, 8);
+
+% ============================================================
+% WRITE COE FILES — OUTPUT
+% ============================================================
+write_coe('fft_out_real.coe', re_out, 6);
+write_coe('fft_out_imag.coe', im_out, 6);
+write_coe('fft_out_packed48.coe', out_word, 12);
+
+disp('✅ All FFT input/output COE files generated');
+
+
+% ============================================================
+% COE FILE WRITER
+% ============================================================
+function write_coe_file(fname, data, hexwidth)
+
+fid = fopen(fname,'w');
+
+fprintf(fid,'memory_initialization_radix=16;\n');
+fprintf(fid,'memory_initialization_vector=\n');
+
+for k=1:length(data)-1
+    if data(k) < 0
+        val = data(k) + 2^(hexwidth*4);
+    else
+        val = data(k);
+    end
+    fprintf(fid,['%0',num2str(hexwidth),'X,\n'], val);
+end
+
+val = data(end);
+if val < 0
+    val = val + 2^(hexwidth*4);
+end
+fprintf(fid,['%0',num2str(hexwidth),'X;\n'], val);
+
+fclose(fid);
+end
+
+
+
+
+
+
+otfs
+
+% ============================================================
+% PARAMETERS — MATCH YOUR RTL + FFT IP
+% ============================================================
+N    = 64;      % FFT length
+GRID = 64;      % OTFS grid size (64 frames)
+
+IN_W  = 16;     % input width
+OUT_W = 24;     % FFT output width
+
+% ============================================================
+% GENERATE OTFS 64×64 COMPLEX GRID
+% deterministic (repeatable)
+% ============================================================
+otfs = zeros(N, GRID);
+
+for c = 1:GRID
+    for r = 1:N
+        otfs(r,c) = exp(1j*2*pi*(r-1)*(c-1)/N);
+    end
+end
+
+% ============================================================
+% COLUMN SERIALIZATION — MATCHES YOUR FSM STREAM
+% frame0 → samples 0..63
+% frame1 → samples 64..127
+% ============================================================
+x_serial = reshape(otfs, [], 1);   % 4096 samples
+
+% ============================================================
+% INPUT FIXED POINT — 16 BIT — TRUNCATION
+% ============================================================
+scale_in = 2^(IN_W-1);
+
+re_in = fix(real(x_serial)*scale_in);
+im_in = fix(imag(x_serial)*scale_in);
+
+re_in = max(min(re_in,  2^(IN_W-1)-1), -2^(IN_W-1));
+im_in = max(min(im_in,  2^(IN_W-1)-1), -2^(IN_W-1));
+
+x_fixed = re_in + 1j*im_in;
+
+% ============================================================
+% FRAME-WISE FFT (MATCHES FFT IP OPERATION)
+% ============================================================
+X_frames = zeros(N, GRID);
+
+for c = 1:GRID
+    idx = (c-1)*N + (1:N);
+    X_frames(:,c) = fft(x_fixed(idx));   % UNSCALED
+end
+
+X_serial = reshape(X_frames, [], 1);
+
+% ============================================================
+% OUTPUT TRUNCATION — 24 BIT — NO ROUNDING
+% ============================================================
+re_out = fix(real(X_serial));
+im_out = fix(imag(X_serial));
+
+re_out = max(min(re_out,  2^(OUT_W-1)-1), -2^(OUT_W-1));
+im_out = max(min(im_out,  2^(OUT_W-1)-1), -2^(OUT_W-1));
+
+% ============================================================
+% PACK INPUT → 32 BIT (BRAM FORMAT)
+% ============================================================
+in32 = zeros(length(re_in),1,'uint32');
+
+for k=1:length(re_in)
+    in32(k) = bitshift(uint32(typecast(int16(re_in(k)),'uint16')),16) + ...
+                      uint32(typecast(int16(im_in(k)),'uint16'));
+end
+
+% ============================================================
+% PACK OUTPUT → 48 BIT (FFT AXIS FORMAT)
+% ============================================================
+out48 = zeros(length(re_out),1,'uint64');
+
+for k=1:length(re_out)
+    r = uint64(typecast(int32(re_out(k)),'uint32'));
+    i = uint64(typecast(int32(im_out(k)),'uint32'));
+    out48(k) = bitshift(r,24) + bitand(i, hex2dec('FFFFFF'));
+end
+
+% ============================================================
+% WRITE COE FILES
+% ============================================================
+write_coe('otfs_in_real.coe', re_in, 4);
+write_coe('otfs_in_imag.coe', im_in, 4);
+write_coe('otfs_in_packed32.coe', in32, 8);
+
+write_coe('otfs_out_real.coe', re_out, 6);
+write_coe('otfs_out_imag.coe', im_out, 6);
+write_coe('otfs_out_packed48.coe', out48, 12);
+
+save('otfs_fft_matlab_golden.mat', ...
+     'x_serial','X_serial','re_in','im_in','re_out','im_out');
+
+disp('✅ OTFS 64x64 FFT MATLAB golden + COE files generated');
+
+
+% ============================================================
+% COE WRITER
+% ============================================================
+function write_coe(fname, data, hexwidth)
+
+fid = fopen(fname,'w');
+fprintf(fid,'memory_initialization_radix=16;\n');
+fprintf(fid,'memory_initialization_vector=\n');
+
+for k=1:length(data)-1
+    v = data(k);
+    if v < 0
+        v = v + 2^(hexwidth*4);
+    end
+    fprintf(fid,['%0',num2str(hexwidth),'X,\n'], v);
+end
+
+v = data(end);
+if v < 0
+    v = v + 2^(hexwidth*4);
+end
+fprintf(fid,['%0',num2str(hexwidth),'X;\n'], v);
+
+fclose(fid);
+end
+
+Matches Your RTL Design Exactly
+This aligns with your current system:
+Your RTL
+MATLAB model
+BRAM width 32
+packed input32
+BRAM depth 4096
+64×64 serialized
+FFT length 64
+per-column FFT
+Unscaled
+no normalization
+Truncation
+fix()
+Natural order
+default FFT
+Output 48-bit
+packed48
