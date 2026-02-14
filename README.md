@@ -1,4 +1,4 @@
-`timescale 1ns / 1ps 
+n`timescale 1ns / 1ps 
 
 module Top_fft #( 
         parameter DATAWIDTH = 16,
@@ -503,3 +503,117 @@ fprintf(fid,'%06X;\n', vec(end));
 fclose(fid);
 end
 
+
+IFFT
+
+% ============================================================
+% IFFT FROM VIVADO FFT IP OUTPUT (48-bit packed COE)
+% ============================================================
+
+clear; clc;
+
+N = 64;
+OUT_W = 24;
+
+% ============================================================
+% READ FFT OUTPUT COE
+% ============================================================
+
+txt = readlines('fft_out_packed48.coe');
+txt = strip(txt);
+
+% keep only hex data lines
+isData = startsWith(txt, ...
+ ["0","1","2","3","4","5","6","7","8","9","A","B","C","D","E","F"]);
+txt = txt(isData);
+
+txt = erase(txt,{',',';'});
+
+fft48 = uint64(hex2dec(txt));
+
+% ============================================================
+% UNPACK 48-bit WORD
+% [47:24]=IMAG   [23:0]=REAL
+% ============================================================
+
+MASK24 = uint64(hex2dec('FFFFFF'));
+
+real_u = bitand(fft48, MASK24);
+imag_u = bitshift(fft48, -24);
+
+real_s = sign24(real_u);
+imag_s = sign24(imag_u);
+
+X = double(real_s) + 1j*double(imag_s);
+
+% ============================================================
+% IFFT (UNSCALED CORES ⇒ divide by N)
+% ============================================================
+
+x_rec = ifft(X, N) / N;
+
+% ============================================================
+% QUANTIZE BACK TO 16-bit (LIKE ORIGINAL INPUT)
+% ============================================================
+
+IN_W = 16;
+L = 2^(IN_W-1);
+
+xr = fix(real(x_rec));
+xi = fix(imag(x_rec));
+
+xr = max(min(xr,L-1),-L);
+xi = max(min(xi,L-1),-L);
+
+% ============================================================
+% PACK BACK TO 32-bit (YOUR SWAPPED FORMAT)
+% [31:16]=IMAG  [15:0]=REAL
+% ============================================================
+
+in32 = zeros(N,1,'uint32');
+
+for k=1:N
+    r = typecast(int16(xr(k)),'uint16');
+    i = typecast(int16(xi(k)),'uint16');
+    in32(k) = bitshift(uint32(i),16) + uint32(r);
+end
+
+% ============================================================
+% WRITE IFFT COE FILES
+% ============================================================
+
+write_coe('ifft_out_real.coe', xr, 4);
+write_coe('ifft_out_imag.coe', xi, 4);
+write_coe('ifft_out_packed32.coe', in32, 8);
+
+disp('✅ IFFT reconstruction complete');
+
+% ============================================================
+% -------- helpers --------
+% ============================================================
+
+function s = sign24(u)
+u = uint32(u);
+neg = bitget(u,24);
+s = int32(u);
+s(neg==1) = s(neg==1) - 2^24;
+end
+
+function write_coe(fname,data,hexw)
+fid=fopen(fname,'w');
+fprintf(fid,'memory_initialization_radix=16;\n');
+fprintf(fid,'memory_initialization_vector=\n');
+
+for k=1:length(data)-1
+    v = data(k);
+    if v < 0
+        v = v + 2^(hexw*4);
+    end
+    fprintf(fid,['%0',num2str(hexw),'X,\n'], v);
+end
+
+v=data(end);
+if v<0, v=v+2^(hexw*4); end
+fprintf(fid,['%0',num2str(hexw),'X;\n'], v);
+fclose(fid);
+end
