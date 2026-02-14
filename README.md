@@ -617,3 +617,135 @@ if v<0, v=v+2^(hexw*4); end
 fprintf(fid,['%0',num2str(hexw),'X;\n'], v);
 fclose(fid);
 end
+
+
+matlab fft signed decimal
+
+MATLAB — FFT → COE (Signed Decimal)
+% ============================================================
+% FFT COE GENERATOR — SIGNED DECIMAL
+% ============================================================
+
+clear; clc;
+
+N = 64;
+IN_W  = 16;
+OUT_W = 24;
+
+% ---------------- TEST SIGNAL ----------------
+n = 0:N-1;
+x = exp(1j*2*pi*5*n/N);
+
+% ---------------- FIXED INPUT ----------------
+S = 2^(IN_W-1);
+xr = fix(real(x)*S);
+xi = fix(imag(x)*S);
+
+xr = max(min(xr,S-1),-S);
+xi = max(min(xi,S-1),-S);
+
+x_fixed = xr + 1j*xi;
+
+% ---------------- FFT ----------------
+X = fft(x_fixed,N);   % unscaled
+
+L = 2^(OUT_W-1);
+re = fix(real(X));
+im = fix(imag(X));
+
+re = max(min(re,L-1),-L);
+im = max(min(im,L-1),-L);
+
+% ---------------- PACK ----------------
+in32  = int64(bitshift(int64(xi),16) + bitand(int64(xr),65535));
+out48 = int64(bitshift(int64(im),24) + bitand(int64(re),2^24-1));
+
+% ---------------- WRITE COE ----------------
+write_coe_dec('fft_in_real.coe', xr);
+write_coe_dec('fft_in_imag.coe', xi);
+write_coe_dec('fft_in_packed32.coe', in32);
+
+write_coe_dec('fft_out_real.coe', re);
+write_coe_dec('fft_out_imag.coe', im);
+write_coe_dec('fft_out_packed48.coe', out48);
+
+disp('✅ FFT decimal COE files written');
+
+% ============================================================
+function write_coe_dec(fname,data)
+fid=fopen(fname,'w');
+fprintf(fid,'memory_initialization_radix=10;\n');
+fprintf(fid,'memory_initialization_vector=\n');
+
+for k=1:length(data)-1
+    fprintf(fid,'%d,\n', data(k));
+end
+fprintf(fid,'%d;\n', data(end));
+fclose(fid);
+end
+
+
+
+MATLAB — IFFT From FFT Packed48 → COE (Signed Decimal)
+
+% ============================================================
+% IFFT COE GENERATOR — SIGNED DECIMAL
+% Reads fft_out_packed48.coe (decimal)
+% ============================================================
+
+clear; clc;
+
+N = 64;
+
+% ---------------- READ DECIMAL COE ----------------
+txt = readlines('fft_out_packed48.coe');
+txt = strip(txt);
+txt = txt(startsWith(txt,"-") | isstrprop(extractBefore(txt,2),'digit'));
+txt = erase(txt,{',',';'});
+
+d = int64(str2double(txt));
+
+% ---------------- UNPACK ----------------
+real24 = bitand(d, 2^24-1);
+imag24 = bitshift(d,-24);
+
+real24 = sign_extend(real24,24);
+imag24 = sign_extend(imag24,24);
+
+X = double(real24) + 1j*double(imag24);
+
+% ---------------- IFFT ----------------
+x = ifft(X,N)/N;
+
+xr = fix(real(x));
+xi = fix(imag(x));
+
+xr = max(min(xr,32767),-32768);
+xi = max(min(xi,32767),-32768);
+
+packed32 = int64(bitshift(int64(xi),16) + bitand(int64(xr),65535));
+
+% ---------------- WRITE ----------------
+write_coe_dec('ifft_out_real.coe', xr);
+write_coe_dec('ifft_out_imag.coe', xi);
+write_coe_dec('ifft_out_packed32.coe', packed32);
+
+disp('✅ IFFT decimal COE files written');
+
+% ============================================================
+function y = sign_extend(v,bits)
+m = 2^(bits-1);
+y = v;
+y(v>=m) = v(v>=m) - 2^bits;
+end
+
+function write_coe_dec(fname,data)
+fid=fopen(fname,'w');
+fprintf(fid,'memory_initialization_radix=10;\n');
+fprintf(fid,'memory_initialization_vector=\n');
+for k=1:length(data)-1
+    fprintf(fid,'%d,\n', data(k));
+end
+fprintf(fid,'%d;\n', data(end));
+fclose(fid);
+end
